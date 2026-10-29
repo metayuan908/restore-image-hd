@@ -1,0 +1,4 @@
+interface:
+  display_name: "GPT高清重绘拼接"
+  short_description: "分割蒙版重绘、整图锚定与4K/8K原生细节拼接"
+  default_prompt: "Use $restore-image-hd to run the conservative route gate, prefer mask-driven segmented redraw for connected posters and products, preserve protected text deterministically, and use no detail-upscaling engine."

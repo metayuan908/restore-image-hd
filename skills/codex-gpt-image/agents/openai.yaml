@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex GPT Image"
+  short_description: "Generate or edit images through local Codex subscription auth"
+  default_prompt: "Use $codex-gpt-image to generate or edit an image with local Codex authentication."
