@@ -42,7 +42,7 @@ def round_up_16(value: float) -> int:
     return max(16, int((value + 15) // 16 * 16))
 
 
-def largest_model_size(width: int, height: int) -> tuple[int, int]:
+def largest_model_size(width: int, height: int, pixel_budget: int = 1_500_000) -> tuple[int, int]:
     ratio = width / height
     best: tuple[int, int, int, float] | None = None
     for request_width in range(16, MAX_MODEL_EDGE + 1, 16):
@@ -50,9 +50,11 @@ def largest_model_size(width: int, height: int) -> tuple[int, int]:
         if request_height < 16 or request_height > MAX_MODEL_EDGE:
             continue
         pixels = request_width * request_height
-        if not MIN_MODEL_PIXELS <= pixels <= MAX_MODEL_PIXELS:
+        if not MIN_MODEL_PIXELS <= pixels <= min(MAX_MODEL_PIXELS, pixel_budget):
             continue
         ratio_error = abs(request_width / request_height - ratio) / ratio
+        if ratio_error > 0.01 or max(request_width, request_height) > 3 * min(request_width, request_height):
+            continue
         candidate = (pixels, request_width, request_height, ratio_error)
         if best is None or candidate[0] > best[0] or (
             candidate[0] == best[0] and candidate[3] < best[3]
@@ -64,29 +66,18 @@ def largest_model_size(width: int, height: int) -> tuple[int, int]:
 
 
 def default_tile_geometry(
-    target_width: int, target_height: int, structural: bool
+    target_width: int, target_height: int, structural: bool, native_pixel_budget: int = 1_200_000
 ) -> tuple[int, int, int, int]:
-    if target_width * target_height <= 2_500_000:
+    # Near-square destination crops use the observed/conservative capacity well.
+    # Tile dimensions INCLUDE all overlap/context pixels sent for redraw.
+    budget = native_pixel_budget
+    if target_width * target_height <= budget:
         return target_width, target_height, 0, 0
-    if structural:
-        ratio = target_width / target_height
-        if 0.8 <= ratio <= 1.25:
-            tile_width = min(target_width, 1280)
-            tile_height = min(target_height, round_up_16(tile_width / ratio))
-        elif ratio > 1:
-            tile_width = min(target_width, 1536)
-            tile_height = min(target_height, round_up_16(tile_width / ratio))
-        else:
-            tile_height = min(target_height, 1536)
-            tile_width = min(target_width, round_up_16(tile_height * ratio))
-        overlap_x = 0 if tile_width == target_width else round_up_16(tile_width / 8)
-        overlap_y = 0 if tile_height == target_height else round_up_16(tile_height / 8)
-        return tile_width, tile_height, overlap_x, overlap_y
-    overlap_x = round_up_16(target_width / 15)
-    overlap_y = round_up_16(target_height / 15)
-    tile_width = round_up_16((target_width + overlap_x) / 2)
-    tile_height = round_up_16((target_height + overlap_y) / 2)
-    return tile_width, tile_height, overlap_x, overlap_y
+    tile_width = min(target_width, max(16, int((budget * 1.2) ** .5) // 16 * 16))
+    tile_height = min(target_height, max(16, (budget // tile_width) // 16 * 16))
+    overlap_x = 0 if tile_width == target_width else min(128, tile_width // 8)
+    overlap_y = 0 if tile_height == target_height else min(128, tile_height // 8)
+    return tile_width,tile_height,overlap_x,overlap_y
 
 
 def axis_seams(tiles: list[dict], axis: str) -> list[int]:
@@ -342,7 +333,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--overlap-y", type=int)
     parser.add_argument(
         "--merge-mode",
-        choices=("core", "feather"),
+        choices=("core", "feather", "minimum-error"),
         help=(
             "Default: feather for low-risk scenery/texture/background/abstract; "
             "core for structural content."
@@ -381,7 +372,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--max-tiles", type=int, default=64)
-    parser.add_argument("--retries", type=int, default=2)
+    parser.add_argument("--retries", type=int, default=1)
+    parser.add_argument("--pilot-count", type=int, default=1)
+    parser.add_argument("--approve-pilot", action="store_true")
     parser.add_argument("--force-output", action="store_true")
     parser.add_argument("--allow-aspect-change", action="store_true")
     parser.add_argument(
@@ -393,6 +386,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--color-luma-limit", type=float, default=28)
     parser.add_argument("--color-chroma-limit", type=float, default=18)
     parser.set_defaults(skip_seam_repair=True)
+    from redraw_runtime import add_runtime_arguments
+    add_runtime_arguments(parser)
     return parser
 
 
@@ -422,7 +417,7 @@ def main() -> int:
     output = args.output.expanduser().resolve()
     if not source.is_file():
         raise SystemExit(f"Input image not found: {source}")
-    if output.exists() and not args.force_output:
+    if output.exists() and not args.force_output and not args.resume:
         raise SystemExit(f"Output already exists: {output}. Pass --force-output to replace it.")
     if args.scale is not None and args.scale < 1:
         raise SystemExit("--scale must be at least 1.")
@@ -457,6 +452,8 @@ def main() -> int:
     if target_width <= 0 or target_height <= 0:
         raise SystemExit("Target dimensions must be positive.")
 
+    from redraw_runtime import native_budget, scoped_profile
+    budget = native_budget(args.native_profile, scoped_profile(find_gpt_cli(args.gpt_cli), args.quality), args.native_pixel_budget)
     (
         default_tile_width,
         default_tile_height,
@@ -466,6 +463,7 @@ def main() -> int:
         target_width,
         target_height,
         args.content_mode in structural_modes,
+        budget,
     )
     tile_width = args.tile_width or args.tile_size or default_tile_width
     tile_height = args.tile_height or args.tile_size or default_tile_height
@@ -479,7 +477,9 @@ def main() -> int:
         if args.overlap_y is not None
         else args.overlap if args.overlap is not None else default_overlap_y
     )
-    request_width, request_height = largest_model_size(tile_width, tile_height)
+    if tile_width * tile_height > budget:
+        raise SystemExit("Tile including overlap exceeds actual/conservative native budget; use smaller tiles before any image request.")
+    request_width, request_height = largest_model_size(tile_width, tile_height, max(1_500_000,budget))
     tile_pixels = request_width * request_height
     tile_ratio = max(request_width, request_height) / min(
         request_width, request_height
@@ -568,6 +568,11 @@ def main() -> int:
             print(split_result.stdout.strip())
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    expected_geometry={"canvas_width":target_width,"canvas_height":target_height,
+                       "tile_width":tile_width,"tile_height":tile_height,
+                       "overlap_x":overlap_x,"overlap_y":overlap_y}
+    if any(manifest.get(k)!=v for k,v in expected_geometry.items()):
+        raise SystemExit("Resumed tile layout differs; choose a new work directory instead of reusing old coordinates.")
     tiles = manifest["tiles"]
     if len(tiles) > args.max_tiles:
         raise SystemExit(
@@ -591,277 +596,76 @@ def main() -> int:
         print("Dry run complete; no GPT Image requests were sent.")
         return 0
 
-    gpt_cli = find_gpt_cli(args.gpt_cli)
-    environment = subprocess_environment()
-    try:
-        auth_result = run_command(
-            [sys.executable, str(gpt_cli), "auth-status"],
-            environment,
-        )
-    except RuntimeError as exc:
-        raise SystemExit(f"Codex OAuth check failed: {exc}") from exc
-    if auth_result.stdout.strip():
-        print(auth_result.stdout.strip())
-
-    processed_tiles.mkdir(parents=True, exist_ok=True)
-    resized_outputs = 0
-    previous_run_path = work_dir / "run.json"
-    previous_native_by_file: dict[str, dict[str, object]] = {}
-    if args.resume and previous_run_path.is_file():
-        try:
-            previous_run = json.loads(previous_run_path.read_text(encoding="utf-8"))
-            previous_native_by_file = {
-                str(item["file"]): item
-                for item in previous_run.get("tile_native_dimensions", [])
-            }
-        except (json.JSONDecodeError, KeyError, TypeError):
-            previous_native_by_file = {}
-    tile_native_dimensions: list[dict[str, object]] = []
-    for index, tile in enumerate(tiles, start=1):
-        source_tile = source_tiles / tile["file"]
-        processed_tile = processed_tiles / tile["file"]
-        if processed_tile.is_file() and args.resume:
-            print(f"[{index}/{len(tiles)}] Resume: {processed_tile.name}", flush=True)
-            if processed_tile.name in previous_native_by_file:
-                tile_native_dimensions.append(
-                    previous_native_by_file[processed_tile.name]
-                )
-            else:
-                with Image.open(processed_tile) as resumed:
-                    resumed_size = resumed.size
-                tile_native_dimensions.append(
-                    {
-                        "file": processed_tile.name,
-                        "native": None,
-                        "normalized": list(resumed_size),
-                        "normalization_upscale": None,
-                        "native_dimensions_unavailable_after_resume": True,
-                    }
-                )
-            continue
-
-        prompt = tile_prompt(
-            tile,
-            target_width,
-            target_height,
-            user_instruction,
-            context_image is not None,
-        )
-        command = [
-            sys.executable,
-            str(gpt_cli),
-            "generate",
-            "--prompt",
-            prompt,
-            "--image",
-            str(source_tile),
-        ]
-        if context_image:
-            command.extend(["--image", str(context_image)])
-        command.extend(
-            [
-                "--size",
-                f"{request_width}x{request_height}",
-                "--quality",
-                args.quality,
-                "--output-format",
-                "png",
-                "--out",
-                str(processed_tile),
-                "--timeout",
-                "300",
-            ]
-        )
-
-        print(f"[{index}/{len(tiles)}] GPT redraw: {source_tile.name}", flush=True)
-        error: RuntimeError | None = None
-        for attempt in range(args.retries + 1):
-            try:
-                result = run_command(command, environment)
-                if result.stderr.strip():
-                    print(result.stderr.strip())
-                error = None
-                break
-            except RuntimeError as exc:
-                error = exc
-                if attempt < args.retries:
-                    print(f"Retrying tile after error: {exc}", flush=True)
-                    time.sleep(1)
-        if error:
-            raise SystemExit(
-                f"Tile {source_tile.name} failed; rerun with --resume after fixing: {error}"
-            )
-        expected_size = (int(tile["width"]), int(tile["height"]))
-        normalized, native_size, normalization_upscale = normalize_tile(
-            processed_tile,
-            expected_size,
-            source_tile,
-        )
-        tile_native_dimensions.append(
-            {
-                "file": processed_tile.name,
-                "native": list(native_size),
-                "normalized": list(expected_size),
-                "normalization_upscale": normalization_upscale,
-            }
-        )
-        if normalized:
-            resized_outputs += 1
-            print(
-                f"Normalized {processed_tile.name} to "
-                f"{expected_size[0]}x{expected_size[1]}"
-            )
-
-    low_risk_modes = {"texture", "background", "scenery", "abstract"}
-    merge_mode = args.merge_mode or (
-        "feather" if args.content_mode in low_risk_modes else "core"
-    )
-    merge_tiles = processed_tiles
-    color_harmonization = len(tiles) > 1 and not args.no_color_harmonization
-    harmonization_report: Path | None = None
-    if color_harmonization:
-        harmonized_tiles = work_dir / "harmonized"
-        harmonize_script = Path(__file__).resolve().with_name("harmonize_tiles.py")
-        try:
-            harmonize_result = run_command(
-                [
-                    sys.executable,
-                    str(harmonize_script),
-                    str(manifest_path),
-                    str(source_tiles),
-                    str(processed_tiles),
-                    str(harmonized_tiles),
-                    "--blur-radius",
-                    str(args.color_blur_radius),
-                    "--luma-limit",
-                    str(args.color_luma_limit),
-                    "--chroma-limit",
-                    str(args.color_chroma_limit),
-                ]
-            )
-        except RuntimeError as exc:
-            raise SystemExit(f"Tile color harmonization failed: {exc}") from exc
-        if harmonize_result.stdout.strip():
-            print(harmonize_result.stdout.strip())
-        merge_tiles = harmonized_tiles
-        harmonization_report = harmonized_tiles / "harmonization.json"
-
-    merge_command = [
-        sys.executable,
-        str(tile_script),
-        "merge",
-        str(manifest_path),
-        str(merge_tiles),
-        str(output),
-        "--mode",
-        merge_mode,
-    ]
-    if args.force_output:
-        merge_command.append("--force")
-    try:
-        merge_result = run_command(merge_command)
-    except RuntimeError as exc:
-        raise SystemExit(f"Tile merge failed: {exc}") from exc
-    if merge_result.stdout.strip():
-        print(merge_result.stdout.strip())
-
-    seam_repair_used = False
-    seam_repair_raw_size: tuple[int, int] | None = None
-    if len(tiles) > 1 and not args.skip_seam_repair:
-        seam_mask = work_dir / "seam-mask.png"
-        seam_repair_raw = work_dir / "seam-repair-raw.png"
-        create_seam_mask(
-            manifest,
-            seam_mask,
-            max(16, overlap_x),
-            max(16, overlap_y),
-        )
-        if not (args.resume and seam_repair_raw.is_file()):
-            seam_prompt = """Seam repair for a high-resolution reconstructed image.
-Edit only the transparent masked seam bands. Make all colors, gradients, lighting,
-textures, edges, lines, branches, product geometry, typography, and other content
-continue naturally across every join. Remove straight seams, cutoffs, duplicates,
-ghosts, color shifts, and exposure steps. Preserve every unmasked pixel and the
-overall composition exactly. Do not add, remove, move, redesign, reframe, or invent
-content. Do not add text or a watermark. Return the complete image."""
-            repair_command = [
-                sys.executable,
-                str(gpt_cli),
-                "generate",
-                "--prompt",
-                seam_prompt,
-                "--image",
-                str(output),
-                "--mask",
-                str(seam_mask),
-                "--size",
-                f"{target_width}x{target_height}",
-                "--quality",
-                args.quality,
-                "--output-format",
-                "png",
-                "--out",
-                str(seam_repair_raw),
-                "--timeout",
-                "300",
-            ]
-            print("Final GPT seam repair", flush=True)
-            try:
-                repair_result = run_command(repair_command, environment)
-            except RuntimeError as exc:
-                raise SystemExit(
-                    f"Seam repair failed; rerun with --resume after fixing: {exc}"
-                ) from exc
-            if repair_result.stderr.strip():
-                print(repair_result.stderr.strip())
-        with Image.open(seam_repair_raw) as repaired:
-            seam_repair_raw_size = repaired.size
-        composite_seam_repair(
-            output,
-            seam_repair_raw,
-            seam_mask,
-            output,
-            args.seam_feather,
-        )
-        seam_repair_used = True
-        print(
-            f"Reinserted repaired seams into {target_width}x{target_height} canvas; "
-            f"raw repair={seam_repair_raw_size[0]}x{seam_repair_raw_size[1]}"
-        )
-
-    run_metadata = {
-        "input": str(source),
-        "output": str(output),
-        "content_mode": args.content_mode,
-        "structural_tiling_acknowledged": args.allow_structural_tiling,
-        "source_dimensions": [source_width, source_height],
-        "target_dimensions": [target_width, target_height],
-        "tile_dimensions": [tile_width, tile_height],
-        "gpt_request_dimensions": [request_width, request_height],
-        "overlap": [overlap_x, overlap_y],
-        "merge_mode": merge_mode,
-        "preset": args.preset,
-        "tile_count": len(tiles),
-        "quality": args.quality,
-        "global_context": str(context_image) if context_image else None,
-        "tile_native_dimensions": tile_native_dimensions,
-        "pixel_enlargement_allowed": False,
-        "normalized_tile_outputs": resized_outputs,
-        "color_harmonization": color_harmonization,
-        "color_harmonization_report": (
-            str(harmonization_report) if harmonization_report else None
-        ),
-        "seam_repair": seam_repair_used,
-        "seam_feather": args.seam_feather,
-        "seam_repair_raw_dimensions": seam_repair_raw_size,
-        "model": "gpt-image-2",
-        "authentication": "Codex OAuth",
-    }
-    (work_dir / "run.json").write_text(
-        json.dumps(run_metadata, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    print(f"Completed GPT tile redraw: {output}")
+    # All routes share the same durable generation/QC engine. The tiler owns
+    # geometry; the engine owns immutable crops, bounded workers and checkpoints.
+    from PIL import ImageDraw
+    from redraw_runtime import runtime_flags, atomic_json
+    region_masks = work_dir / "region-masks"
+    region_masks.mkdir(parents=True, exist_ok=True)
+    semantic_regions = []
+    x_seams = axis_seams(tiles,"x")
+    y_seams = axis_seams(tiles,"y")
+    merge_mode = args.merge_mode or "minimum-error"
+    for i,tile in enumerate(tiles):
+        x,y,w,h = (int(tile[k]) for k in ("x","y","width","height"))
+        box=(x,y,x+w,y+h)
+        edit_box=list(box)
+        if merge_mode == "core":
+            # Mid-overlap ownership, preserving the legacy explicit core option.
+            for seam in x_seams:
+                if x < seam < x+w:
+                    if seam <= x+w/2:edit_box[0]=max(edit_box[0],seam)
+                    else:edit_box[2]=min(edit_box[2],seam)
+            for seam in y_seams:
+                if y < seam < y+h:
+                    if seam <= y+h/2:edit_box[1]=max(edit_box[1],seam)
+                    else:edit_box[3]=min(edit_box[3],seam)
+        mask_path = region_masks / f"tile-{i+1:04d}.png"
+        mask=Image.new("L",(target_width,target_height),0)
+        ImageDraw.Draw(mask).rectangle((edit_box[0],edit_box[1],edit_box[2]-1,edit_box[3]-1),fill=255)
+        mask.save(mask_path)
+        semantic_regions.append({"name":f"tile-{i+1:04d}","mask":str(mask_path),
+                                 "crop_bbox":box,"expand":0,"priority":i,
+                                 "mode":args.content_mode,
+                                 "instruction":tile_prompt(tile,target_width,target_height,user_instruction,context_image is not None)})
+    regions_path=work_dir / "regions.json"
+    atomic_json(regions_path,{"regions":semantic_regions})
+    engine=Path(__file__).with_name("gpt_segmented_redraw.py")
+    command=[sys.executable,str(engine),str(source),str(output),"--manifest",str(regions_path),
+             "--target-width",str(target_width),"--target-height",str(target_height),
+             "--work-dir",str(work_dir / "engine"),"--gpt-cli",str(find_gpt_cli(args.gpt_cli)),
+             "--quality",args.quality,"--mask-expand","0","--context-padding","0",
+             "--minimum-padding","0","--max-regions",str(args.max_tiles),
+             "--pilot-count",str(args.pilot_count),"--retries",str(args.retries),
+             "--color-blur-radius",str(args.color_blur_radius),"--color-luma-limit",str(args.color_luma_limit),
+             "--color-chroma-limit",str(args.color_chroma_limit),*runtime_flags(args)]
+    if context_image:command.extend(["--context-image",str(context_image)])
+    if merge_mode in ("core","feather"):
+        command.extend(["--seam-mode","feather"])
+    if merge_mode=="core":command.extend(["--mask-feather","0"])
+    if args.no_color_harmonization:command.append("--no-color-harmonization")
+    for flag in ("resume","force_output","approve_pilot","allow_aspect_change"):
+        if getattr(args,flag,False):command.append("--"+flag.replace("_","-"))
+    if not args.skip_seam_repair:
+        raise SystemExit("Full-canvas repair is no longer dispatched blindly. Inspect seam QA and submit only failed regions to the segmented runner.")
+    # Stream progress instead of capturing an entire multi-minute child run.
+    completed=subprocess.run(command,env=subprocess_environment())
+    if completed.returncode:
+        raise SystemExit(completed.returncode)
+    engine_run=work_dir / "engine/run.json"
+    engine_status_path=work_dir / "engine/status.json"
+    engine_status=json.loads(engine_status_path.read_text()) if engine_status_path.is_file() else {}
+    atomic_json(work_dir / "status.json",engine_status)
+    if not engine_run.is_file() or engine_status.get("state")!="completed":
+        print("Pilot needs visual review; rerun --resume --approve-pilot after inspection.")
+        return 0
+    metadata=json.loads(engine_run.read_text())
+    metadata.update(tile_count=len(tiles),tile_dimensions=[tile_width,tile_height],
+                    gpt_request_dimensions=[request_width,request_height],
+                    tile_native_dimensions=[{"file":r["name"],"native":r["native_dimensions"],
+                                             "normalized":r["normalized_dimensions"]} for r in metadata["records"]],
+                    merge_mode=merge_mode)
+    atomic_json(work_dir / "run.json",metadata)
     return 0
 
 

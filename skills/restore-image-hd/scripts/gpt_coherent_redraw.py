@@ -72,24 +72,8 @@ def find_gpt_cli(explicit: str | None) -> Path:
 
 
 def largest_model_size(target_width: int, target_height: int) -> tuple[int, int]:
-    ratio = target_width / target_height
-    best: tuple[int, int, int, float] | None = None
-    for width in range(16, MAX_MODEL_EDGE + 1, 16):
-        height = round((width / ratio) / 16) * 16
-        if height < 16 or height > MAX_MODEL_EDGE:
-            continue
-        pixels = width * height
-        if not MIN_MODEL_PIXELS <= pixels <= MAX_MODEL_PIXELS:
-            continue
-        ratio_error = abs(width / height - ratio) / ratio
-        candidate = (pixels, width, height, ratio_error)
-        if best is None or candidate[0] > best[0] or (
-            candidate[0] == best[0] and candidate[3] < best[3]
-        ):
-            best = candidate
-    if best is None:
-        raise SystemExit("Cannot choose a valid GPT Image size for this aspect ratio.")
-    return best[1], best[2]
+    from gpt_tile_redraw import largest_model_size as choose_request
+    return choose_request(target_width,target_height)
 
 
 def read_instruction(args: argparse.Namespace) -> str:
@@ -211,9 +195,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-anchor-aspect-drift", type=float, default=0.05)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--retries", type=int, default=2)
+    parser.add_argument("--retries", type=int, default=1)
+    parser.add_argument("--pilot-count", type=int, default=1)
+    parser.add_argument("--approve-pilot", action="store_true")
     parser.add_argument("--force-output", action="store_true")
     parser.add_argument("--allow-aspect-change", action="store_true")
+    from redraw_runtime import add_runtime_arguments
+    add_runtime_arguments(parser)
     return parser
 
 
@@ -223,7 +211,7 @@ def main() -> int:
     output = args.output.expanduser().resolve()
     if not source.is_file():
         raise SystemExit(f"Input image not found: {source}")
-    if output.exists() and not args.force_output:
+    if output.exists() and not args.force_output and not args.resume:
         raise SystemExit(f"Output already exists: {output}. Pass --force-output.")
     if (args.target_width is None) != (args.target_height is None):
         raise SystemExit("Pass both --target-width and --target-height.")
@@ -285,53 +273,33 @@ def main() -> int:
             raise SystemExit(f"Codex OAuth check failed: {exc}") from exc
         if auth.stdout.strip():
             print(auth.stdout.strip())
-        if not (args.resume and anchor_raw.is_file()):
-            command = [
-                sys.executable,
-                str(gpt_cli),
-                "generate",
-                "--prompt",
-                prompt,
-                "--image",
-                str(source),
-            ]
-            for reference in references:
-                command.extend(["--image", str(reference)])
-            command.extend(
-                [
-                    "--size",
-                    f"{request_dimensions[0]}x{request_dimensions[1]}",
-                    "--quality",
-                    args.quality,
-                    "--output-format",
-                    "png",
-                    "--out",
-                    str(anchor_raw),
-                    "--timeout",
-                    "300",
-                ]
-            )
-            error: RuntimeError | None = None
-            for attempt in range(args.retries + 1):
-                try:
-                    result = run_command(command, environment)
-                    if result.stderr.strip():
-                        print(result.stderr.strip())
-                    error = None
-                    break
-                except RuntimeError as exc:
-                    error = exc
-                    if attempt < args.retries:
-                        print(f"Retrying global anchor after error: {exc}", flush=True)
-                        time.sleep(1)
-            if error:
-                raise SystemExit(f"Global anchor redraw failed: {error}")
+        from redraw_runtime import run_jobs, signature, file_hash, scoped_profile
+        from redraw_quality import inspect_native
+        scope=scoped_profile(gpt_cli,args.quality,include_auth=False)
+        anchor_job={"id":"global-anchor","signature":signature({"source":file_hash(source),
+                    "references":[file_hash(p) for p in references],"prompt":prompt,
+                    "request":request_dimensions,"scope":scope,"background":"opaque"})}
+        def generate_anchor(job, raw):
+            command=[sys.executable,str(gpt_cli),"generate","--prompt",prompt,"--image",str(source)]
+            for reference in references:command.extend(["--image",str(reference)])
+            command.extend(["--size",f"{request_dimensions[0]}x{request_dimensions[1]}","--quality",args.quality,
+                            "--background","opaque","--output-format","png","--out",str(raw),"--timeout","300"])
+            run_command(command,environment)
+        def inspect_anchor(raw, job):
+            with Image.open(raw) as opened:size=opened.size
+            result=inspect_native(raw,size)
+            drift=abs(size[0]/size[1]/target_ratio-1)
+            if drift>args.max_anchor_aspect_drift:
+                raise RuntimeError("Global anchor aspect drift exceeds limit")
+            return result
+        from redraw_runtime import JobLock
+        with JobLock(work_dir):
+            anchor_records=run_jobs([anchor_job],generate_anchor,inspect_anchor,work_dir,
+                                    workers=1,resume=args.resume,retries=args.retries,
+                                    reset_ids={"global-anchor"} if "global-anchor" in args.retry_region else set())
+        anchor_raw=Path(anchor_records[0]["raw_path"])
         native_width, native_height, cropped = crop_anchor_to_ratio(
-            anchor_raw,
-            target_ratio,
-            anchor,
-            args.max_anchor_aspect_drift,
-        )
+            anchor_raw, target_ratio, anchor, args.max_anchor_aspect_drift)
     else:
         native_width, native_height, cropped = source_dimensions[0], source_dimensions[1], False
 
@@ -359,6 +327,10 @@ def main() -> int:
         "--max-tiles",
         str(args.max_tiles),
     ]
+    from redraw_runtime import runtime_flags
+    tile_command.extend(runtime_flags(args))
+    tile_command.extend(["--pilot-count",str(args.pilot_count),"--retries",str(args.retries)])
+    if args.approve_pilot:tile_command.append("--approve-pilot")
     if instruction:
         tile_command.extend(["--instruction", instruction])
     for option, value in (
@@ -377,16 +349,18 @@ def main() -> int:
         tile_command.append("--force-output")
     if args.allow_aspect_change:
         tile_command.append("--allow-aspect-change")
-    try:
-        tile_result = run_command(tile_command, environment)
-    except RuntimeError as exc:
-        raise SystemExit(f"Native-detail tile stage failed: {exc}") from exc
-    if tile_result.stdout.strip():
-        print(tile_result.stdout.strip())
+    completed=subprocess.run(tile_command,env=environment)
+    if completed.returncode:
+        raise SystemExit(completed.returncode)
     if args.dry_run:
         print("Dry run complete; no GPT Image requests were sent.")
         return 0
 
+    tile_status_path=tile_work_dir / "status.json"
+    tile_status=json.loads(tile_status_path.read_text()) if tile_status_path.is_file() else {}
+    if not (tile_work_dir / "run.json").is_file() or tile_status.get("state")!="completed":
+        print("Tile pilot awaits review; use --resume --approve-pilot after inspection.")
+        return 0
     tile_metadata = json.loads((tile_work_dir / "run.json").read_text(encoding="utf-8"))
     metadata = {
         "input": str(source),

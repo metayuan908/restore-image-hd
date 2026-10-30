@@ -9,6 +9,62 @@ Create a redraw-first workflow. Do not use Real-ESRGAN, super-resolution models,
 face enhancers, or interpolation as a detail-generation route. Final high-resolution
 detail must come from GPT Image tile redraws and stitching.
 
+## Execution defaults and timing
+
+Use the existing runners; do not write task-specific opaque-output wrappers,
+temporary registration pipelines, or alternative schedulers during a redraw.
+Run one dependency/authentication preflight before generation. Pillow and NumPy
+are required. Translation alignment uses NumPy; optional affine alignment needs
+OpenCV and must be checked **before** image requests.
+
+All three routes now share the durable segmented engine. It exports immutable
+source crops before dispatch, generates with `--jobs 2`, and composes serially in
+manifest priority order. A 429 reduces dispatch to one worker and receives a
+bounded retry. Ambiguous network/timeout errors stop new dispatch, save completed
+peers, and require `--resume`; do not blindly repeat a possibly completed POST.
+
+Do not equate the requested image size with the native return size. Until a
+representative pilot is observed, destination crops **including context** use a
+conservative 1,200,000-pixel budget. This is a planning default, not a universal
+model limit. Oversized semantic masks fail before requests; subdivide at natural
+boundaries rather than cutting connected subjects. Runners save
+`native-profile.json` from actual returns. Reuse it with `--native-profile FILE`
+only for the matching backend, CLI/model, quality and local authentication
+revision, within 72 hours. The first pilot still validates every native edge and
+aspect ratio; an insufficient donor is never enlarged.
+
+For opaque or transparent sources, request opaque RGB detail donors. Reapply any
+original alpha deterministically. Unexpected transparent donors fail validation
+instead of turning into black sky. Keep sky and other already-approved flat
+areas protected when they need no new detail; retain the redraw-coverage gate.
+
+Segmented jobs support `--stage prepare|generate|compose|all`. Preparation and
+compose-only runs send no image requests. The first pilot writes
+`pilot-composite.png` and pauses; inspect it at 100%, then use
+`--resume --approve-pilot`. Approval applies only to the same pilot inputs and
+processing settings. This is the agent's quality-review checkpoint, not a new
+user-permission question. Track work from manifests and checkpoints, not chat
+progress counts. Review the pilot and final QA; inspect intermediate tiles when
+a check fails instead of repeatedly rebuilding the entire workflow.
+
+`events.jsonl` records per-stage times and failures immediately. Per-job records
+hash source crop, edit mask, context, prompt, native response and settings.
+`--resume` reuses only matching, intact native files, and changed inputs invalidate
+only affected jobs. Use `--resume --retry-region NAME` to regenerate a failed or explicitly rejected
+region while retaining immutable earlier attempts and valid peers.
+Old/unhashed 0.4.1 outputs are not silently trusted. No
+concurrent coordinators may share a work directory. Keep raw attempts immutable.
+
+Default geometric QC uses bounded translation. `--alignment affine` permits only
+small affine corrections (2% scale/shear, 1 degree rotation, bounded shift).
+Nonlinear flow is not a default restoration step: it can bend architectural
+lines. Alignment precedes color matching. Large edge mismatch, missing border
+coverage or excessive boundary change goes to `quality-report.json` and blocks
+export; redraw only failed complete regions. `--seam-mode minimum-error` chooses
+a continuous low-error path when a real narrow overlap exists. Irregular overlaps
+are explicitly reported as feather fallback and still require visual review.
+Neither an edge score nor a clean seam proves semantic correctness.
+
 ## Portable runtime
 
 Resolve every script relative to this `SKILL.md`; never hardcode the source
@@ -168,7 +224,7 @@ python scripts/gpt_coherent_redraw.py \
 
 The global result is a composition anchor, not the delivered resolution. Final
 detail is generated again tile by tile. The structural defaults use smaller
-tiles and maximum valid GPT request dimensions so model outputs only downsample
+tiles and conservative, empirically checked request dimensions so model outputs only downsample
 into delivery tiles. If either native edge is smaller than its delivery tile,
 the job fails; reduce tile dimensions instead of adding an upscaler.
 
@@ -199,12 +255,15 @@ plus `2k-landscape`, `full-hd`, `2k-portrait`, `square-2k`,
 `social-square`, `social-portrait`, `story`, and `ultrawide-4k`. Exact custom
 dimensions use `--target-width` and `--target-height`.
 
-The script requests the largest valid GPT Image output at each tile ratio,
+The script requests a conservatively sized GPT Image output at each tile ratio,
 normalizes it to the smaller delivery tile, discards conflicting overlap cores,
 matches every tile's low-frequency Y/Cb/Cr response to the corresponding source
 tile, and stitches the canvas. Low-risk scenery, texture, background, and
 abstract modes feather overlaps by default; structural modes use core stitching.
 It records every native tile size and color-correction report in `run.json`.
+The default merge selects low-error overlap seams; `--merge-mode core` and
+`--merge-mode feather` remain explicit alternatives. All routes use the same
+native-size, transparency, resume and timing checks.
 
 Structural modes require both `--allow-structural-tiling` and
 `--context-image`; normally use `gpt_coherent_redraw.py`, which supplies both
@@ -275,6 +334,18 @@ python scripts/deliver_image.py output.png
 ```
 
 The delivery script creates the folder and avoids overwriting existing files.
+User, repository and task workspace placement instructions take precedence over
+that legacy default. Do not create an additional delivery directory when the
+current task already specifies an outputs location.
+
+## Offline validation
+
+From the plugin source root, run `python -m unittest discover -s tests -v` using
+the same Pillow/NumPy runtime as production. Tests use an offline fake image CLI;
+they never read authentication tokens or send model requests. Keep native-size
+and aspect rejection, alpha handling, input invalidation, interrupted resume,
+rate-limit fallback, deterministic composition and geometric/seam cases covered.
+Do not claim live backend speedup from a fake-endpoint benchmark.
 
 ## Resources
 

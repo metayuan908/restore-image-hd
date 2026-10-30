@@ -94,12 +94,28 @@ For every region:
 1. Resize the mask to the exact delivery canvas with nearest-neighbor sampling.
 2. Expand the mask slightly, subtract protected masks, and compute its bounding box.
 3. Add 15–30% context padding without cutting connected geometry.
-4. Request the largest valid native GPT Image size at the crop aspect ratio.
+4. Validate the crop against a recent actual-return profile or the conservative
+   1.2 MP delivery budget. Request a matching valid aspect ratio, not the maximum
+   theoretical API canvas. Include context in the budget.
 5. Fail if either native response edge is smaller than the delivery crop.
-6. Match spatial low-frequency Y/Cb/Cr to the authoritative source crop.
+6. Check opaque donor alpha, bounded geometry and strong-edge displacement, then
+   match spatial low-frequency Y/Cb/Cr to the immutable authoritative source crop.
 7. Measure the harmonized boundary ring against the authoritative crop.
 8. Reject boundary change above the configured threshold.
-9. Composite only the mask into the canvas with a small feather.
+9. Choose a continuous low-error seam where a real narrow overlap exists, then
+   composite only editable mask pixels. Feathering never leaks into protected areas.
+
+Source crops and the context image are frozen before dispatch. Interior regions
+are independent generation jobs (`--jobs 2`); composition remains ordered and
+serial. `--stage prepare`, `--stage generate` and `--stage compose` separate these
+operations. A verified unchanged pilot approval survives resume. Changed pilot
+inputs/settings require renewed agent visual review. No additional human
+permission is implied by that quality checkpoint.
+
+Inspect `quality-report.json` for all failed regions before requesting repairs.
+Per-job records and `events.jsonl` survive partial failures. File existence alone
+does not authorize resume; hashes, settings, native dimensions and opaque alpha
+must still match. Native attempts are never overwritten.
 
 Keep color harmonization enabled for aged paper, paintings, skies, gradients,
 walls, and any surface where local GPT edits can create rectangular exposure or

@@ -28,9 +28,11 @@ unlikely to change the connected structure.
 2. Keep the original source as the authoritative local crop source.
 3. Split the target canvas into smaller overlapping tiles.
 4. Send each local crop as Image 1 and the complete anchor as Image 2.
-5. Request the largest allowed model dimensions matching the tile ratio.
+5. Plan from a scoped actual-return profile or the conservative 1.2 MP delivery
+   crop budget, including overlap. Validate the pilot's native dimensions.
 6. Accept only native outputs whose width and height both cover the delivery tile.
-7. Normalize down to the tile dimensions, core-stitch, and inspect every boundary.
+7. Normalize down, check bounded geometry, match color, select overlap seams and
+   inspect every boundary. Generators use fixed inputs; composition is serial.
 
 The first pass is not an upscaling stage. It supplies global object count,
 perspective, pose, assembly, and material relationships to every local redraw.
@@ -73,11 +75,11 @@ legal copy, measurements, or brand marks.
 
 ## Tile geometry
 
-- Structural 16:9 jobs default near `1536x864` tiles with about 12.5% overlap.
-- Structural square jobs default near `1280x1280`.
-- A 4K structural landscape usually needs about 9 GPT tile calls plus one global
-  anchor call.
-- An 8K structural landscape can need about 36 tile calls plus one anchor call.
+- The default conservative budget commonly yields `1200x992` crops, including
+  approximately 12.5% overlap (capped at 128 pixels per axis).
+- A representative 3840-wide landscape needs roughly 12 tile calls, plus the
+  global anchor for the coherent route. Actual dimensions and profiles change
+  the count; use `--dry-run` rather than hardcoding it.
 - `2x2` tiles of `1024x1024` cover at most `2048x2048` before overlap, not 4K.
 - Overlap reduces unique coverage.
 
@@ -87,12 +89,13 @@ detail-upscaling model.
 
 ## Seam handling
 
-Core stitching discards conflicting overlap regions and remains the structural
-default. Low-risk content uses source-anchored Y/Cb/Cr harmonization followed by
-feather merge so sky, water, fog, and gradients do not show brightness or hue steps.
-Full-canvas GPT seam repair is disabled because the service can return a smaller
-image than requested. If explicitly enabled, a smaller repair donor is rejected,
-not enlarged.
+Default merging chooses a continuous low-error path in a real narrow overlap;
+complex overlaps explicitly report feather fallback. Explicit `core` and
+`feather` modes remain available. Bounded translation is the geometry default;
+optional affine requires OpenCV, small parameter bounds, and improved edge QC.
+Nonlinear flow must not bend connected architecture. Color matching follows
+geometry checks. Full-canvas GPT seam repair is no longer blindly dispatched:
+submit a focused repair manifest for failed complete regions instead.
 
 When a visible join is semantic rather than tonal—for example a broken frame,
 finger, limb, edge highlight, or perspective line—rerun that subject as one

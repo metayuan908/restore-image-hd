@@ -4,10 +4,18 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import math
 import json
 import sys
 import time
 from pathlib import Path
+
+from redraw_runtime import (Journal, JobLock, add_runtime_arguments, atomic_json,
+                            file_hash, native_budget, run_jobs, save_capacity,
+                            scoped_profile, signature, utc_now)
+from redraw_quality import (align_donor, alignment_valid_mask, inspect_native,
+                            minimum_error_selector, normalize_native)
 
 try:
     from PIL import Image, ImageChops, ImageFilter, ImageStat
@@ -108,23 +116,25 @@ def mask_for_gpt(edit_mask: Image.Image) -> Image.Image:
     return result
 
 
+def request_bbox(bbox, canvas_size):
+    """Expand context for narrow masks; never stretch a long thin edge ring."""
+    left,top,right,bottom=bbox
+    width,height=right-left,bottom-top
+    need_width=max(width,math.ceil(height/3))
+    need_height=max(height,math.ceil(width/3))
+    if need_width>canvas_size[0] or need_height>canvas_size[1]:
+        raise RuntimeError("Region cannot fit GPT's 3:1 aspect limit; split at a semantic boundary")
+    left=max(0,min(canvas_size[0]-need_width,(left+right-need_width)//2))
+    top=max(0,min(canvas_size[1]-need_height,(top+bottom-need_height)//2))
+    return left,top,left+need_width,top+need_height
+
+
 def normalize_donor(
     path: Path,
     expected: tuple[int, int],
     normalized_path: Path,
 ) -> tuple[tuple[int, int], Image.Image]:
-    with Image.open(path) as opened:
-        donor = opened.convert("RGB")
-    native = donor.size
-    if donor.width < expected[0] or donor.height < expected[1]:
-        raise RuntimeError(
-            f"GPT returned {donor.width}x{donor.height}, below editable crop "
-            f"{expected[0]}x{expected[1]}; refusing pixel enlargement"
-        )
-    if donor.size != expected:
-        donor = donor.resize(expected, Image.Resampling.LANCZOS)
-    donor.save(normalized_path)
-    return native, donor
+    return normalize_native(path, expected, normalized_path)
 
 
 def harmonize_donor(
@@ -238,7 +248,7 @@ def composite_region(
 ) -> None:
     selector = edit_mask.crop(bbox)
     if feather > 0:
-        selector = selector.filter(ImageFilter.GaussianBlur(feather))
+        selector = ImageChops.darker(selector.filter(ImageFilter.GaussianBlur(feather)), selector)
     base_crop = canvas.crop(bbox).convert("RGB")
     merged = Image.composite(donor.convert("RGB"), base_crop, selector)
     canvas.paste(merged, bbox[:2])
@@ -353,9 +363,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gpt-cli")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--retries", type=int, default=2)
+    parser.add_argument("--retries", type=int, default=1, help="Bounded rate-limit retries; ambiguous network failures require resume.")
+    parser.add_argument("--stage", choices=("all", "prepare", "generate", "compose"), default="all")
     parser.add_argument("--force-output", action="store_true")
     parser.add_argument("--allow-aspect-change", action="store_true")
+    add_runtime_arguments(parser)
     return parser
 
 
@@ -415,6 +427,8 @@ def call_gpt(
             quality,
             "--output-format",
             "png",
+            "--background",
+            "opaque",
             "--out",
             str(donor_path),
             "--timeout",
@@ -439,7 +453,17 @@ def call_gpt(
 
 
 def main() -> int:
+    wall_started = time.monotonic()
     args = build_parser().parse_args()
+    if not 655_360 <= args.native_pixel_budget <= 8_294_400:
+        raise SystemExit("--native-pixel-budget must be between 655360 and 8294400.")
+    if args.max_shift < 0 or args.max_edge_distance < 0:
+        raise SystemExit("Geometry limits must be non-negative.")
+    if args.alignment == "affine":
+        try:
+            import cv2
+        except ImportError as exc:
+            raise SystemExit("Affine alignment needs OpenCV before generation; use translation or install OpenCV.") from exc
     source = args.input.expanduser().resolve()
     output = args.output.expanduser().resolve()
     manifest_path = args.manifest.expanduser().resolve()
@@ -521,13 +545,10 @@ def main() -> int:
                     "silently fall back to enlarged source detail."
                 )
         region["_order"] = index
-    regions.sort(
-        key=lambda item: (
-            0 if item.get("pilot") else 1,
-            int(item.get("priority", 0)),
-            int(item["_order"]),
-        )
-    )
+    names = [str(region["name"]) for region in regions]
+    if len(names) != len(set(names)):
+        raise SystemExit("Region names must be unique.")
+    regions.sort(key=lambda item: (int(item.get("priority", 0)), int(item["_order"])))
 
     if source_rgba.size != target_size:
         canvas = source_rgba.resize(target_size, Image.Resampling.LANCZOS).convert("RGB")
@@ -559,6 +580,22 @@ def main() -> int:
         else output.parent / f".{output.stem}-segmented"
     )
     work_dir.mkdir(parents=True, exist_ok=True)
+    gpt_cli = find_gpt_cli(args.gpt_cli)
+    capacity_scope = scoped_profile(gpt_cli, args.quality)
+    generation_scope = scoped_profile(gpt_cli, args.quality, include_auth=False)
+    profile_path = args.native_profile or (work_dir / "native-profile.json")
+    if profile_path.is_file():
+        try:
+            budget = native_budget(profile_path, capacity_scope, args.native_pixel_budget)
+        except ValueError:
+            if args.native_profile:
+                raise
+            budget = args.native_pixel_budget
+            print("Cached capacity profile expired/changed; using conservative planning budget.")
+    else:
+        if args.native_profile:
+            raise SystemExit(f"Native profile does not exist: {profile_path}")
+        budget = args.native_pixel_budget
     prepared: list[dict] = []
     plan_regions: list[dict] = []
     for region in regions:
@@ -576,6 +613,14 @@ def main() -> int:
             )
         except ValueError as exc:
             raise SystemExit(f"Region {region['name']}: {exc}") from exc
+        if region.get("crop_bbox") is not None:
+            supplied = tuple(map(int, region["crop_bbox"]))
+            core = edit.getbbox()
+            if len(supplied) != 4 or not (0 <= supplied[0] <= core[0] < core[2] <= supplied[2] <= target_size[0]
+                                       and 0 <= supplied[1] <= core[1] < core[3] <= supplied[3] <= target_size[1]):
+                raise SystemExit(f"Region {region['name']}: crop_bbox must contain its editable mask within canvas.")
+            bbox = supplied
+        bbox = request_bbox(bbox,target_size)
         crop_size = (bbox[2] - bbox[0], bbox[3] - bbox[1])
         if crop_size[0] > 3840 or crop_size[1] > 3840:
             raise SystemExit(
@@ -583,7 +628,9 @@ def main() -> int:
                 "the 3840 edge limit. Split the semantic mask without cutting a "
                 "connected subject, or reduce context padding."
             )
-        request_size = largest_model_size(*crop_size)
+        if crop_size[0] * crop_size[1] > budget:
+            raise SystemExit(f"Region {region['name']} crop {crop_size} exceeds measured/conservative native budget {budget} pixels including context. Replan smaller semantic regions before any image request.")
+        request_size = largest_model_size(*crop_size, pixel_budget=max(1_500_000, budget))
         if request_size[0] < crop_size[0] or request_size[1] < crop_size[1]:
             raise SystemExit(
                 f"Region {region['name']} needs crop {crop_size[0]}x{crop_size[1]}, "
@@ -665,10 +712,6 @@ def main() -> int:
         "resolution_claim": resolution_claim,
         "regions": plan_regions,
     }
-    (work_dir / "plan.json").write_text(
-        json.dumps(plan, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
     print(
         f"Plan: {source_size[0]}x{source_size[1]} -> "
         f"{target_size[0]}x{target_size[1]}; {len(prepared)} masked regions; "
@@ -676,277 +719,295 @@ def main() -> int:
     )
     print(f"Work directory: {work_dir}")
     if args.dry_run:
+        atomic_json(work_dir / "plan.json",plan)
         print("Dry run complete; no GPT Image requests were sent.")
         return 0
 
-    gpt_cli = find_gpt_cli(args.gpt_cli)
+    # Source canvas is immutable throughout generation. Only this coordinator
+    # mutates the final composition, in manifest priority order.
+    baseline = canvas.copy()
     environment = subprocess_environment()
-    try:
-        auth_result = run_command(
-            [sys.executable, str(gpt_cli), "auth-status"], environment
-        )
-    except RuntimeError as exc:
-        raise SystemExit(f"Codex OAuth check failed: {exc}") from exc
-    if auth_result.stdout.strip():
-        print(auth_result.stdout.strip())
+    journal = Journal(work_dir)
+    journal.event("preflight_complete", seconds=time.monotonic()-wall_started,
+                  native_pixel_budget=budget, workers=args.jobs)
+    jobs = []
+    item_by_id = {}
+    generation_dispatch_seconds = 0.0
+    context_digest = file_hash(context_image) if context_image else None
+    processing_signature = signature({key: getattr(args, key) for key in (
+        "alignment", "max_shift", "max_edge_distance", "seam_mode", "mask_feather",
+        "boundary_ring", "max_boundary_delta", "no_color_harmonization",
+        "color_blur_radius", "color_luma_limit", "color_chroma_limit",
+        "detail_blur_radius", "detail_strength", "detail_limit")})
 
-    records: list[dict] = []
-    for index, item in enumerate(prepared, start=1):
-        region = item["region"]
-        name = str(region["name"])
-        safe_name = "".join(character if character.isalnum() else "-" for character in name)
-        bbox = item["bbox"]
-        edit = item["edit"]
-        crop_path = work_dir / f"{index:02d}-{safe_name}-crop.png"
-        mask_path = work_dir / f"{index:02d}-{safe_name}-mask.png"
-        donor_path = work_dir / f"{index:02d}-{safe_name}-raw.png"
-        normalized_path = work_dir / f"{index:02d}-{safe_name}-normalized.png"
-        canvas.crop(bbox).save(crop_path)
-        mask_for_gpt(edit.crop(bbox)).save(mask_path)
-        prompt = build_prompt(
-            region,
-            "interior",
-            context_image is not None,
-            args.instruction or "",
-        )
-        resumed = args.resume and donor_path.is_file()
-        if not resumed:
-            print(f"[{index}/{len(prepared)}] Masked redraw: {name}", flush=True)
-            try:
-                call_gpt(
-                    gpt_cli,
-                    environment,
-                    crop_path,
-                    mask_path,
-                    donor_path,
-                    prompt,
-                    item["request_size"],
-                    args.quality,
-                    context_image,
-                    args.retries,
-                )
-            except RuntimeError as exc:
-                raise SystemExit(
-                    f"Region {name} failed; rerun with --resume after fixing: {exc}"
-                ) from exc
-        native, donor = normalize_donor(
-            donor_path,
-            item["crop_size"],
-            normalized_path,
-        )
-        with Image.open(crop_path) as opened:
-            base_crop = opened.convert("RGB")
-        color_report = None
-        detail_report = None
-        if bool(region.get("detail_only", False)):
-            donor, detail_report = transfer_detail(
-                base_crop,
-                donor,
-                float(region.get("detail_blur_radius", args.detail_blur_radius)),
-                float(region.get("detail_strength", args.detail_strength)),
-                float(region.get("detail_limit", args.detail_limit)),
-            )
-            donor.save(work_dir / f"{index:02d}-{safe_name}-detail-transfer.png")
-        elif not args.no_color_harmonization:
-            donor, color_report = harmonize_donor(
-                base_crop,
-                donor,
-                args.color_blur_radius,
-                args.color_luma_limit,
-                args.color_chroma_limit,
-            )
-            donor.save(work_dir / f"{index:02d}-{safe_name}-harmonized.png")
-        delta = boundary_delta(
-            base_crop,
-            donor,
-            edit.crop(bbox),
-            int(region.get("boundary_ring", args.boundary_ring)),
-        )
-        if delta > args.max_boundary_delta:
-            raise SystemExit(
-                f"Region {name} boundary delta {delta:.3f} exceeds "
-                f"{args.max_boundary_delta:.3f}; rejecting structural drift."
-            )
-        composite_region(
-            canvas,
-            donor,
-            edit,
-            bbox,
-            int(region.get("feather", args.mask_feather)),
-        )
-        records.append(
-            {
-                "name": name,
-                "pass": "interior",
-                "native_dimensions": list(native),
-                "normalized_dimensions": list(item["crop_size"]),
-                "raw_donor": str(donor_path),
-                "normalized_donor": str(normalized_path),
-                "resumed": resumed,
-                "boundary_delta": delta,
-                "color_harmonization": color_report,
-                "detail_transfer": detail_report,
-                "accepted": True,
-            }
-        )
-        if index == min(args.pilot_count, len(prepared)) and args.pilot_count:
-            pilot_path = work_dir / "pilot-composite.png"
-            canvas.save(pilot_path)
-            (work_dir / "pilot-run.json").write_text(
-                json.dumps(
-                    {**plan, "records": records},
-                    ensure_ascii=False,
-                    indent=2,
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            if index < len(prepared) and not args.approve_pilot:
-                print(
-                    f"Pilot preview written: {pilot_path}\n"
-                    "Inspect it at 100%, then rerun with --resume --approve-pilot. "
-                    "No final delivery was written.",
-                    flush=True,
-                )
-                return 0
-            print(
-                f"Pilot approved for {index} region(s); continuing batch.",
-                flush=True,
-            )
-
-    if args.edge_pass:
-        for index, item in enumerate(prepared, start=1):
+    def prepare_jobs(items, anchor, pass_name):
+        result = []
+        for index, item in enumerate(items):
             region = item["region"]
-            name = str(region["name"])
-            safe_name = "".join(
-                character if character.isalnum() else "-" for character in name
-            )
-            edit = item["edit"]
-            bbox = item["bbox"]
-            ring_width = int(region.get("edge_ring", args.edge_ring))
-            ring = ImageChops.subtract(
-                expand_mask(edit, ring_width), erode_mask(edit, ring_width)
-            )
-            ring = subtract_mask(ring, protected)
-            if ring.getbbox() is None:
-                continue
-            crop_path = work_dir / f"{index:02d}-{safe_name}-edge-crop.png"
-            mask_path = work_dir / f"{index:02d}-{safe_name}-edge-mask.png"
-            donor_path = work_dir / f"{index:02d}-{safe_name}-edge-raw.png"
-            normalized_path = (
-                work_dir / f"{index:02d}-{safe_name}-edge-normalized.png"
-            )
-            canvas.crop(bbox).save(crop_path)
-            mask_for_gpt(ring.crop(bbox)).save(mask_path)
-            prompt = build_prompt(
-                region,
-                "edge",
-                context_image is not None,
-                args.instruction or "",
-            )
-            resumed = args.resume and donor_path.is_file()
-            if not resumed:
-                print(f"[edge {index}/{len(prepared)}] {name}", flush=True)
-                try:
-                    call_gpt(
-                        gpt_cli,
-                        environment,
-                        crop_path,
-                        mask_path,
-                        donor_path,
-                        prompt,
-                        item["request_size"],
-                        args.quality,
-                        context_image,
-                        args.retries,
-                    )
-                except RuntimeError as exc:
-                    raise SystemExit(
-                        f"Edge pass for {name} failed; rerun with --resume: {exc}"
-                    ) from exc
-            native, donor = normalize_donor(
-                donor_path,
-                item["crop_size"],
-                normalized_path,
-            )
-            color_report = None
-            detail_report = None
-            if bool(region.get("detail_only", False)):
-                with Image.open(crop_path) as opened:
-                    base_crop = opened.convert("RGB")
-                donor, detail_report = transfer_detail(
-                    base_crop,
-                    donor,
-                    float(region.get("detail_blur_radius", args.detail_blur_radius)),
-                    float(region.get("detail_strength", args.detail_strength)),
-                    float(region.get("detail_limit", args.detail_limit)),
-                )
-                donor.save(work_dir / f"{index:02d}-{safe_name}-edge-detail-transfer.png")
-            elif not args.no_color_harmonization:
-                with Image.open(crop_path) as opened:
-                    base_crop = opened.convert("RGB")
-                donor, color_report = harmonize_donor(
-                    base_crop,
-                    donor,
-                    args.color_blur_radius,
-                    args.color_luma_limit,
-                    args.color_chroma_limit,
-                )
-                donor.save(work_dir / f"{index:02d}-{safe_name}-edge-harmonized.png")
-            composite_region(
-                canvas,
-                donor,
-                ring,
-                bbox,
-                int(region.get("edge_feather", args.mask_feather)),
-            )
-            records.append(
-                {
-                    "name": name,
-                    "pass": "edge",
-                    "native_dimensions": list(native),
-                    "normalized_dimensions": list(item["crop_size"]),
-                    "raw_donor": str(donor_path),
-                    "normalized_donor": str(normalized_path),
-                    "resumed": resumed,
-                    "color_harmonization": color_report,
-                    "detail_transfer": detail_report,
-                    "accepted": True,
-                }
-            )
+            safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in str(region["name"]))
+            job_id = f"{index+1:03d}-{safe}-{pass_name}"
+            prompt = build_prompt(region, pass_name, context_image is not None, args.instruction or "")
+            crop = anchor.crop(item["bbox"]).convert("RGB")
+            selector = mask_for_gpt(item["edit"].crop(item["bbox"]))
+            fingerprint = signature({"schema": 2, "crop": hashlib.sha256(crop.tobytes()).hexdigest(),
+                                     "crop_size": crop.size, "mask": hashlib.sha256(selector.tobytes()).hexdigest(),
+                                     "context": context_digest, "prompt": prompt,
+                                     "request_size": item["request_size"], "scope": generation_scope,
+                                     "background": "opaque"})
+            folder = work_dir / "inputs" / job_id / fingerprint
+            folder.mkdir(parents=True, exist_ok=True)
+            crop_path, mask_path = folder / "crop.png", folder / "mask.png"
+            # Write exact deterministic inputs once; workers receive immutable paths.
+            if not crop_path.is_file():
+                crop.save(crop_path)
+            if not mask_path.is_file():
+                selector.save(mask_path)
+            with Image.open(crop_path) as existing_crop, Image.open(mask_path) as existing_mask:
+                if existing_crop.convert("RGB").tobytes() != crop.tobytes() or existing_mask.tobytes() != selector.tobytes():
+                    raise RuntimeError(f"{job_id}: prepared inputs were changed")
+            job = {"id": job_id, "signature": fingerprint, "prompt": prompt,
+                   "crop_path": crop_path, "mask_path": mask_path,
+                   "expected": item["crop_size"], "request_size": item["request_size"]}
+            item_by_id[job_id] = item
+            result.append(job)
+        return result
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    if source_alpha is not None:
-        rgba = canvas.convert("RGBA")
-        rgba.putalpha(source_alpha)
-        rgba.save(output)
-    else:
-        canvas.save(output)
-    run = {
-        **plan,
-        "quality": args.quality,
-        "mask_expand": args.mask_expand,
-        "mask_feather": args.mask_feather,
-        "context_padding": args.context_padding,
-        "max_boundary_delta": args.max_boundary_delta,
-        "color_harmonization": not args.no_color_harmonization,
-        "color_blur_radius": args.color_blur_radius,
-        "color_luma_limit": args.color_luma_limit,
-        "color_chroma_limit": args.color_chroma_limit,
-        "detail_blur_radius": args.detail_blur_radius,
-        "detail_strength": args.detail_strength,
-        "detail_limit": args.detail_limit,
-        "records": records,
-        "model": "gpt-image-2",
-        "authentication": "Codex OAuth",
-        "pipeline": "semantic masks -> Only Masked crops -> deterministic composite",
-    }
-    (work_dir / "run.json").write_text(
-        json.dumps(run, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    print(f"Completed segmented GPT redraw: {output}")
-    return 0
+    def generate(job, raw):
+        print(f"GPT redraw: {job['id']}", flush=True)
+        # Retries and scheduling are owned by the durable dispatcher, not nested loops.
+        call_gpt(gpt_cli, environment, job["crop_path"], job["mask_path"], raw,
+                 job["prompt"], job["request_size"], args.quality, context_image, 0)
+
+    def inspect(raw, job):
+        return inspect_native(raw, job["expected"])
+
+    def dispatch(selected, **options):
+        nonlocal generation_dispatch_seconds
+        started = time.monotonic()
+        try:
+            resets={job["id"] for job in selected if job["id"] in args.retry_region or item_by_id[job["id"]]["region"]["name"] in args.retry_region}
+            return run_jobs(selected, generate, inspect, work_dir, retries=args.retries,reset_ids=resets, **options)
+        except RuntimeError:
+            # An undersized return is still evidence about actual capacity.
+            observed = []
+            for job in selected:
+                record = work_dir / "jobs" / job["id"] / job["signature"] / "record.json"
+                if record.is_file():
+                    row = json.loads(record.read_text())
+                    if row.get("native_dimensions"):
+                        observed.append(row)
+            save_capacity(work_dir / "native-profile.json", observed, capacity_scope)
+            raise
+        finally:
+            generation_dispatch_seconds += time.monotonic()-started
+
+    def process(job, raw_record):
+        begin = time.monotonic()
+        item = item_by_id[job["id"]]
+        folder = Path(raw_record["raw_path"]).parent
+        processed = folder / f"processed-{processing_signature}.png"
+        acceptance = folder / f"acceptance-{processing_signature}.json"
+        digest = signature({"processing": processing_signature, "region_config": item["region"], "raw": raw_record["raw_sha256"],
+                            "job": job["signature"]})
+        if acceptance.is_file():
+            cached = json.loads(acceptance.read_text())
+            if cached.get("signature") == digest and processed.is_file() and file_hash(processed) == cached.get("processed_sha256"):
+                cached.update(raw_record)
+                cached.update(signature=digest, state="accepted",accepted=True,
+                              resumed=raw_record.get("resumed",False),processing_resumed=True)
+                journal.event("quality_resume",job=job["id"],seconds=0)
+                with Image.open(processed) as opened:
+                    return opened.convert("RGB"), cached
+        native, donor = normalize_donor(Path(raw_record["raw_path"]), item["crop_size"], folder / "normalized.png")
+        with Image.open(job["crop_path"]) as opened:
+            base_crop = opened.convert("RGB")
+        geometry_begin = time.monotonic()
+        donor, geometry = align_donor(base_crop, donor, args.alignment, args.max_shift, args.max_edge_distance)
+        valid = alignment_valid_mask(donor.size, geometry)
+        edit_crop = item["edit"].crop(item["bbox"])
+        # A mask touching an invalid mapped edge is rejected, not filled with black
+        # or silently replaced by an enlarged source crop.
+        lost = ImageChops.subtract(edit_crop, valid)
+        if lost.getbbox() is not None:
+            raise RuntimeError(f"{job['id']}: alignment needs missing native border pixels; use more context or regenerate")
+        geometry_seconds = time.monotonic()-geometry_begin
+        color_report = detail_report = None
+        if bool(item["region"].get("detail_only", False)):
+            donor, detail_report = transfer_detail(base_crop, donor,
+                float(item["region"].get("detail_blur_radius", args.detail_blur_radius)),
+                float(item["region"].get("detail_strength", args.detail_strength)),
+                float(item["region"].get("detail_limit", args.detail_limit)))
+        elif not args.no_color_harmonization:
+            donor, color_report = harmonize_donor(base_crop, donor, args.color_blur_radius,
+                                                  args.color_luma_limit, args.color_chroma_limit)
+        delta = boundary_delta(base_crop, donor, edit_crop, int(item["region"].get("boundary_ring",args.boundary_ring)))
+        if delta > args.max_boundary_delta:
+            raise RuntimeError(f"{job['id']}: boundary delta {delta:.3f} exceeds {args.max_boundary_delta:.3f}")
+        donor.save(processed)
+        row = {**raw_record, "name": str(item["region"]["name"]), "pass": item.get("pass", "interior"),
+               "signature": digest, "generation_signature": job["signature"],
+               "native_dimensions": list(native), "normalized_dimensions": list(item["crop_size"]),
+               "raw_donor": raw_record["raw_path"], "normalized_donor": str(folder / "normalized.png"),
+               "processed_path": str(processed), "processed_sha256": file_hash(processed),
+               "state": "accepted", "accepted": True, "boundary_delta": delta,
+               "geometry": geometry, "geometry_seconds": geometry_seconds,
+               "processing_seconds": time.monotonic()-begin, "color_harmonization": color_report,
+               "detail_transfer": detail_report}
+        atomic_json(acceptance, row)
+        journal.event("quality_complete", job=job["id"], seconds=row["processing_seconds"],
+                      edge_distance=geometry["after"]["p95_pixels"])
+        return donor, row
+
+    def compose_items(selected_jobs, raw_records, target):
+        rows, coverage = [], Image.new("L", target_size, 0)
+        failures = []
+        for job, record in zip(selected_jobs, raw_records):
+            item = item_by_id[job["id"]]
+            try:
+                donor, row = process(job, record)
+            except RuntimeError as error:
+                failures.append({"job":job["id"],"bbox":item["bbox"],"reason":str(error),"state":"quality_failed"})
+                journal.event("quality_failed", **failures[-1])
+                continue
+            edit = item["edit"]
+            box = item["bbox"]
+            selector = edit.crop(box)
+            seam = {"used": False, "reason": "feather mode"}
+            if args.seam_mode == "minimum-error":
+                selector, seam = minimum_error_selector(target.crop(box), donor, selector, coverage.crop(box))
+            feather = int(item["region"].get("edge_feather" if item.get("pass")=="edge" else "feather",args.mask_feather))
+            if feather:
+                selector = ImageChops.darker(selector.filter(ImageFilter.GaussianBlur(feather)), edit.crop(box))
+            target.paste(Image.composite(donor, target.crop(box), selector), box[:2])
+            coverage = ImageChops.lighter(coverage, edit)
+            rows.append({**row, "seam": seam})
+            atomic_json(work_dir / "composition-checkpoint.json", {"state": "partial", "records": rows})
+        atomic_json(work_dir / "quality-report.json", {"passed":len(rows),"failures":failures})
+        if failures:
+            raise RuntimeError(f"{len(failures)} region(s) failed quality checks; see quality-report.json. No final output was exported; regenerate only failed regions.")
+        return rows
+
+    with JobLock(work_dir):
+        if context_image:
+            context_snapshot = work_dir / "inputs" / ("context-"+context_digest+context_image.suffix)
+            context_snapshot.parent.mkdir(parents=True,exist_ok=True)
+            if not context_snapshot.is_file():
+                import shutil
+                shutil.copyfile(context_image,context_snapshot)
+            if file_hash(context_snapshot)!=context_digest:
+                raise RuntimeError("Context input changed; cannot use an inconsistent global anchor")
+            context_image = context_snapshot
+        atomic_json(work_dir / "status.json", {"state":"preparing", "started_at":utc_now()})
+        atomic_json(work_dir / "plan.json",plan)
+        jobs = prepare_jobs(prepared, baseline, "interior")
+        valid_region_ids={job["id"] for job in jobs}|{str(item["region"]["name"]) for item in prepared}
+        if set(args.retry_region)-valid_region_ids:
+            raise RuntimeError("Unknown --retry-region; use a name/job ID from prepared-jobs.json")
+        atomic_json(work_dir / "prepared-jobs.json", [
+            {key: str(value) if isinstance(value, Path) else value for key,value in job.items()} for job in jobs])
+        if args.stage == "prepare":
+            atomic_json(work_dir / "status.json", {"state":"prepared"})
+            print("Immutable crops and masks prepared; no image requests sent.")
+            return 0
+        if args.stage != "compose":
+            try:
+                run_command([sys.executable, str(gpt_cli), "auth-status"], environment)
+            except RuntimeError as exc:
+                raise SystemExit(f"Codex OAuth check failed: {exc}") from exc
+        else:
+            def generate(job, raw):
+                raise RuntimeError("Compose-only stage cannot generate; required verified donor is missing")
+        flagged = [job for job in jobs if item_by_id[job["id"]]["region"].get("pilot")]
+        pilot_jobs = (flagged or jobs)[:min(args.pilot_count,len(jobs))]
+        pilot_ids = {job["id"] for job in pilot_jobs}
+        pilot_input_signature = signature({"jobs": [job["signature"] for job in pilot_jobs],
+                                     "regions": [item_by_id[job["id"]]["region"] for job in pilot_jobs],
+                                     "processing": processing_signature})
+        prior_pilot_path = work_dir / "pilot-review.json"
+        prior_pilot = json.loads(prior_pilot_path.read_text()) if prior_pilot_path.is_file() else {}
+        effective_resume = args.resume or args.stage == "compose"
+        generation_begin = time.monotonic()
+        pilot_records = dispatch(pilot_jobs, workers=min(args.jobs,2), resume=effective_resume)
+        pilot_signature=signature({"inputs":pilot_input_signature,"raw":[row["raw_sha256"] for row in pilot_records]})
+        previously_reviewable = prior_pilot.get("signature") == pilot_signature
+        pilot_approved = previously_reviewable and (args.approve_pilot or prior_pilot.get("state")=="approved")
+        if pilot_jobs:
+            preview = baseline.copy()
+            compose_items(pilot_jobs, pilot_records, preview)
+            if source_alpha is not None:
+                preview=preview.convert("RGBA")
+                preview.putalpha(source_alpha)
+            preview.save(work_dir / "pilot-composite.png")
+            save_capacity(work_dir / "native-profile.json", pilot_records, capacity_scope)
+            atomic_json(prior_pilot_path, {"signature":pilot_signature, "state":"approved" if pilot_approved else "ready_for_visual_review",
+                                          "jobs":[job["id"] for job in pilot_jobs]})
+            if len(pilot_jobs) < len(jobs) and not pilot_approved:
+                atomic_json(work_dir / "status.json", {"state":"pilot_review", "signature":pilot_signature})
+                print(f"Pilot ready: {work_dir / 'pilot-composite.png'}. Inspect at 100%, then --resume --approve-pilot. Remaining requests were not sent.")
+                return 0
+        remaining = [job for job in jobs if job["id"] not in pilot_ids]
+        other_records = dispatch(remaining, workers=args.jobs, resume=effective_resume)
+        by_id = {row["job"]:row for row in pilot_records+other_records}
+        raw_records = [by_id[job["id"]] for job in jobs]
+        generation_wall = time.monotonic()-generation_begin
+        save_capacity(work_dir / "native-profile.json", raw_records, capacity_scope)
+        if args.stage == "generate":
+            atomic_json(work_dir / "status.json", {"state":"generated"})
+            print("Generation checkpoint complete. Use --stage compose --resume for offline assembly.")
+            return 0
+        compose_begin = time.monotonic()
+        generation_before_composition = generation_dispatch_seconds
+        records = compose_items(jobs, raw_records, canvas)
+        if args.edge_pass:
+            # Freeze the entire interior composite before preparing edge jobs.
+            edge_anchor = canvas.copy()
+            edge_items = []
+            for item in prepared:
+                ring_width = int(item["region"].get("edge_ring", args.edge_ring))
+                ring = subtract_mask(ImageChops.subtract(expand_mask(item["edit"],ring_width),
+                                                        erode_mask(item["edit"],ring_width)),protected)
+                if ring.getbbox() is not None:
+                    # Recompute context for the expanded ring; never clip it to
+                    # the old interior bbox (which can silently drop ring pixels).
+                    box = request_bbox(padded_bbox(ring,args.context_padding,args.minimum_padding),target_size)
+                    size = (box[2]-box[0],box[3]-box[1])
+                    if size[0]*size[1] > budget:
+                        raise RuntimeError("Edge crop exceeds native budget; prepare a focused repair manifest instead")
+                    edge_items.append({**item,"edit":ring,"bbox":box,"crop_size":size,
+                                       "request_size":largest_model_size(*size,pixel_budget=max(1_500_000,budget)),"pass":"edge"})
+            edge_jobs = prepare_jobs(edge_items,edge_anchor,"edge")
+            edge_records = dispatch(edge_jobs, workers=args.jobs, resume=effective_resume)
+            records += compose_items(edge_jobs,edge_records,canvas)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        if source_alpha is not None:
+            result = canvas.convert("RGBA")
+            result.putalpha(source_alpha)
+        else:
+            result = canvas
+        temporary_output = work_dir / "verified-output.png"
+        result.save(temporary_output)
+        with Image.open(temporary_output) as checked:
+            checked.load()
+            if checked.size != target_size:
+                raise RuntimeError("Final dimensions changed during export")
+        import shutil
+        shutil.copyfile(temporary_output, output)
+        run = {**plan, "schema_version":2, "quality":args.quality,"records":records,
+               "model":"gpt-image-2","authentication":"Codex OAuth",
+               "source_sha256":file_hash(source),"output_sha256":file_hash(output),
+               "native_pixel_budget":budget,"workers_requested":args.jobs,
+               "immutable_generation_inputs":True,"composition_order":"manifest priority, then original order",
+               "alignment":args.alignment,"seam_mode":args.seam_mode,
+               "generation_wall_seconds":generation_dispatch_seconds,
+               "generation_and_pilot_wall_seconds":generation_wall,
+               "composition_wall_seconds":time.monotonic()-compose_begin-(generation_dispatch_seconds-generation_before_composition),
+               "wall_seconds":time.monotonic()-wall_started,"finished_at":utc_now(),
+               "detail_upscaler_used":False,"pipeline":"immutable masked crops -> bounded generation queue -> geometry QC -> color -> ordered seam composite"}
+        atomic_json(work_dir / "run.json",run)
+        atomic_json(work_dir / "status.json", {"state":"completed", "output_sha256":run["output_sha256"]})
+        journal.event("delivery_complete", output=str(output),wall_seconds=run["wall_seconds"])
+        print(f"Completed segmented GPT redraw: {output}")
+        return 0
 
 
 if __name__ == "__main__":
